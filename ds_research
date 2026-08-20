@@ -1,0 +1,1006 @@
+#!/usr/bin/env python3
+"""
+ds_research — Source-backed web research delegating to DeepSeek Pro/Flash.
+
+Usage:
+  ds_research "query"                         search + fetch + summarise
+  ds_research --url URL ["question"]          fetch one URL, answer question
+  ds_research --urls URL1,URL2 "q"           fetch explicit URLs + answer
+  ds_research --refresh "query"               bypass cache
+  ds_research --flash "query"                 use Flash model (cheaper)
+  ds_research --limit N "query"               fetch N sources (default 3)
+  ds_research --jina-search "query"           force Jina Search (burns ~10k tokens)
+  ds_research --deep "query"                  try all providers, up to 3 Jina searches
+  ds_research --no-paid-token-providers "q"   disable keyed Jina/Brave/Serper entirely
+
+Search cascade (free-first):
+  1. Local source resolver  — installed package source, binary shebang
+  2. GitHub API             — repo/README fetch (60 req/hr, no key)
+  3. DDGS                   — maintained ddgs package
+  4. Jina Search s.jina.ai  — precision fallback; requires JINA_API_KEY;
+                              burns ~10k tokens/request; max 1/call by default
+
+Fetch cascade (for URLs):
+  1. Jina Reader r.jina.ai  — no key, free
+  2. Jina Reader + key      — fallback if rate-limited (burns reader tokens)
+  3. Scrapfly               — if SCRAPFLY_API_KEY set
+  4. Direct HTTP + bs4      — last resort
+
+Key storage: <this directory>/.env  (chmod 600 attempted)
+Cache:       <this directory>/cache/web_research/  (12h TTL)
+Logs:        <this directory>/logs/  (API keys redacted)
+"""
+
+import sys
+import os
+import re
+import json
+import time
+import shutil
+import hashlib
+import textwrap
+import warnings
+import subprocess
+from pathlib import Path
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from urllib.parse import urlparse, parse_qs, unquote
+
+import requests
+from bs4 import BeautifulSoup
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+
+AGENT_DIR    = Path(__file__).resolve().parent
+CACHE_DIR    = AGENT_DIR / "cache" / "web_research"
+LOGS_DIR     = AGENT_DIR / "logs"
+DS_FLASH     = AGENT_DIR / "ds_flash.sh"
+ENV_FILE     = AGENT_DIR / ".env"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+LOGS_DIR.mkdir(parents=True, exist_ok=True)
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+CACHE_TTL               = 3600 * 12
+MAX_SOURCES             = 3
+MAX_CONTENT_CHARS       = 6000
+REQUEST_TIMEOUT         = 20
+JINA_TOKENS_PER_SEARCH  = 10_000  # approximate; treat budget as finite
+UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+BOOST_DOMAINS = {
+    "api-docs.deepseek.com": 5, "platform.deepseek.com": 4,
+    "github.com": 4, "raw.githubusercontent.com": 4,
+    "docs.python.org": 3, "pypi.org": 3, "npmjs.com": 3,
+    "api.openai.com": 3, "platform.openai.com": 3,
+    "readthedocs.io": 2, "readthedocs.org": 2,
+    "roomi-fields.github.io": 5,
+}
+PENALISE_DOMAINS = {
+    "medium.com", "dev.to", "hashnode.dev", "substack.com",
+    "towardsdatascience.com",
+    "deep-seek.com", "deepseek.net", "deepseek.gr.com",
+    "deepseeksr1.com", "deepseekapi.io", "deepseekapi.ai",
+    "chat-deep.ai", "deepseek-usa.ai",
+}
+
+STOPWORDS = {
+    "the","a","an","is","in","of","for","to","and","or","how","does","do",
+    "what","why","when","where","which","with","from","by","on","at","as",
+    "its","it","this","that","are","was","were","be","been","being","have",
+    "has","had","will","would","should","could","may","can","not","no","nor",
+    "but","if","about","via","using","command","behavior","support","native",
+    "live","latest","config","default","init","source",
+    "api","cli","url","http","https","sdk","gui","ui","json","xml","csv",
+    "sql","db","io","os",
+}
+
+TECHNICAL_RE = re.compile(
+    r'\b(init|config|install|api|cli|command|module|package|import|sync|'
+    r'endpoint|version|source|repo|github|flag|behavior|option|method|'
+    r'function|class|schema|database|plugin|parameter|argument|'
+    r'removal|remove|delete|add|register)\b', re.I
+)
+
+# ── Jina usage tracking ───────────────────────────────────────────────────────
+# Jina free balance: ~10M tokens. Each s.jina.ai search costs ~10k tokens.
+# ~1,000 searches before exhaustion. We track locally since Jina has no public
+# balance API. Warn the maintainer at 80% usage (~800 searches).
+
+JINA_USAGE_FILE = CACHE_DIR / "jina_usage.json"
+JINA_FREE_BUDGET = 1_000   # conservative search count before balance runs out
+JINA_WARN_AT    = 800      # warn when this many searches have been used
+
+def _record_jina_usage(n: int = 1):
+    try:
+        data = json.loads(JINA_USAGE_FILE.read_text()) if JINA_USAGE_FILE.exists() else {}
+        data["searches_used"] = data.get("searches_used", 0) + n
+        data["last_updated"]  = datetime.now(timezone.utc).isoformat()
+        JINA_USAGE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        JINA_USAGE_FILE.write_text(json.dumps(data, indent=2))
+    except Exception:
+        pass
+
+def jina_usage_stats() -> dict:
+    try:
+        if JINA_USAGE_FILE.exists():
+            return json.loads(JINA_USAGE_FILE.read_text())
+    except Exception:
+        pass
+    return {"searches_used": 0}
+
+def jina_balance_warning() -> str | None:
+    stats = jina_usage_stats()
+    used = stats.get("searches_used", 0)
+    if used >= JINA_FREE_BUDGET:
+        return f"⚠  JINA BALANCE LIKELY EXHAUSTED ({used}/{JINA_FREE_BUDGET} searches used). Get a new key at https://jina.ai"
+    if used >= JINA_WARN_AT:
+        remaining = JINA_FREE_BUDGET - used
+        return f"⚠  JINA BALANCE LOW: ~{remaining} searches remaining. Consider renewing at https://jina.ai"
+    return None
+
+# ── Runtime types ─────────────────────────────────────────────────────────────
+
+@dataclass
+class RunConfig:
+    query:         str        = ""
+    explicit_urls: list       = field(default_factory=list)
+    use_flash:     bool       = False
+    refresh:       bool       = False
+    limit:         int        = MAX_SOURCES
+    force_jina:    bool       = False  # --jina-search
+    deep:          bool       = False  # --deep
+    no_paid:       bool       = False  # --no-paid-token-providers
+
+@dataclass
+class RunMeta:
+    search_providers:       list  = field(default_factory=list)
+    fetch_providers:        set   = field(default_factory=set)
+    used_jina_key:          bool  = False
+    used_jina_search:       bool  = False
+    jina_search_requests:   int   = 0
+    cache_hits:             int   = 0
+    total_sources:          int   = 0
+    ddgs_quality_poor:      bool  = False
+
+# ── Env loading ───────────────────────────────────────────────────────────────
+
+def _load_env():
+    """
+    Load API keys from (in order of priority):
+      1. AGENT_DIR/.env                          — local project secrets
+      2. $DEEPSEEK_AGENT_SECRETS_DIR/<name>       — one file per key, if set
+      3. $DEEPSEEK_AGENT_ENV_SH                   — shell env fallback, if set
+
+    Layers 2 and 3 are optional integration points for whatever
+    secrets-persistence convention your own environment uses (e.g. a
+    per-pod secrets directory outside the repo) — unset by default, so
+    this is a no-op unless you explicitly configure them.
+    Never prints key values.
+    """
+    # 1. Local .env
+    if ENV_FILE.exists():
+        for line in ENV_FILE.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, _, v = line.partition("=")
+                k, v = k.strip(), v.strip().strip('"\'')
+                if k and v and k not in os.environ:
+                    os.environ[k] = v
+
+    # 2. Optional external secrets directory (one file per key, filename = env var name lowercased)
+    secrets_dir_env = os.environ.get("DEEPSEEK_AGENT_SECRETS_DIR", "")
+    secrets_dir = Path(secrets_dir_env) if secrets_dir_env else None
+    if secrets_dir and secrets_dir.exists():
+        _secret_map = {
+            "jina_api_key":   "JINA_API_KEY",
+            "deepseek_api_key": "DEEPSEEK_API_KEY",
+            "scrapfly_api_key": "SCRAPFLY_API_KEY",
+            "brave_api_key":  "BRAVE_SEARCH_API_KEY",
+            "brave_search_api_key": "BRAVE_SEARCH_API_KEY",
+            "serper_api_key": "SERPER_API_KEY",
+        }
+        for fname, envvar in _secret_map.items():
+            secret_file = secrets_dir / fname
+            if secret_file.exists() and envvar not in os.environ:
+                val = secret_file.read_text().strip()
+                if val:
+                    os.environ[envvar] = val
+
+    # 3. Optional external env.sh
+    pod_env_str = os.environ.get("DEEPSEEK_AGENT_ENV_SH", "")
+    pod_env = Path(pod_env_str) if pod_env_str else None
+    if pod_env and pod_env.exists():
+        for line in pod_env.read_text().splitlines():
+            m = re.match(r'^export\s+([A-Z_][A-Z0-9_]*)=(.+)$', line)
+            if m:
+                k, v = m.group(1), m.group(2).strip('"\'')
+                if k not in os.environ and v:
+                    os.environ[k] = v
+
+_load_env()
+SCRAPFLY_KEY = os.environ.get("SCRAPFLY_API_KEY", "")
+JINA_KEY     = os.environ.get("JINA_API_KEY", "")
+BRAVE_KEY    = os.environ.get("BRAVE_API_KEY", "")
+SERPER_KEY   = os.environ.get("SERPER_API_KEY", "")
+
+def _redact(text: str) -> str:
+    """Redact known API key values from strings (for logging)."""
+    for key_val in [JINA_KEY, SCRAPFLY_KEY, BRAVE_KEY, SERPER_KEY]:
+        if key_val and len(key_val) > 8:
+            text = text.replace(key_val, key_val[:6] + "***")
+    return text
+
+# ── Cache ─────────────────────────────────────────────────────────────────────
+
+def _ckey(kind: str, value: str) -> Path:
+    h = hashlib.sha256(f"{kind}:{value}".encode()).hexdigest()[:16]
+    return CACHE_DIR / f"{h}.json"
+
+def cache_get(kind: str, value: str) -> dict | None:
+    p = _ckey(kind, value)
+    if not p.exists():
+        return None
+    try:
+        d = json.loads(p.read_text())
+        if time.time() - d.get("cached_at", 0) < CACHE_TTL:
+            return d
+    except Exception:
+        pass
+    return None
+
+def cache_set(kind: str, value: str, data: dict):
+    try:
+        data["cached_at"] = time.time()
+        _ckey(kind, value).write_text(json.dumps(data, ensure_ascii=False, indent=2))
+    except Exception:
+        pass
+
+# ── Query analysis ────────────────────────────────────────────────────────────
+
+def is_technical(query: str) -> bool:
+    return bool(TECHNICAL_RE.search(query))
+
+def extract_package_hint(query: str) -> str | None:
+    m = re.search(r'"([A-Za-z][A-Za-z0-9_-]+)"', query)
+    if m:
+        return m.group(1).lower()
+    for w in re.findall(r'\b([A-Z][a-z]+[A-Z][A-Za-z0-9]*)\b', query):  # CamelCase
+        if w.lower() not in STOPWORDS:
+            return w.lower()
+    for w in re.findall(r'\b([A-Z]{2,8})\b', query):  # ALL-CAPS acronyms
+        if w.lower() not in STOPWORDS:
+            return w.lower()
+    for w in re.findall(r'\b[a-z][a-z0-9_-]{2,}\b', query):
+        if w not in STOPWORDS:
+            return w
+    return None
+
+def generate_queries(query: str, hint: str | None) -> list[str]:
+    queries = [query]
+    q_lower = query.lower()
+    if hint and any(w in q_lower for w in ("api", "endpoint", "parameter", "support", "feature")):
+        queries.append(f'{hint} api documentation official site')
+        queries.append(f'site:github.com {hint} api OR docs')
+    elif hint:
+        queries.append(f'"{hint}" {query}')
+        queries.append(f'"{hint}" github documentation')
+    return queries[:3]
+
+# ── Local source resolver ─────────────────────────────────────────────────────
+
+def search_local(query: str, hint: str | None) -> list[dict]:
+    if not hint:
+        return []
+    pkg_dirs = _find_package_dirs(hint)
+    if not pkg_dirs:
+        return []
+    query_terms = [w.lower() for w in re.findall(r'\b\w{3,}\b', query) if w.lower() not in STOPWORDS]
+    sources = []
+    for pkg_dir in pkg_dirs[:2]:
+        py_files = sorted(
+            pkg_dir.rglob("*.py"),
+            key=lambda p: (0 if p.stem in ("config","cli","sync","init","core","cmd") else 1, p.name)
+        )
+        for py_file in py_files[:8]:
+            if "__pycache__" in str(py_file):
+                continue
+            try:
+                text = py_file.read_text(errors="replace")
+            except Exception:
+                continue
+            if not any(t in text.lower() for t in query_terms[:3]):
+                continue
+            relevant = _extract_relevant(text, query_terms)
+            if len(relevant) < 50:
+                continue
+            sources.append({
+                "url":          str(py_file),
+                "title":        f"{py_file.name} (local: {pkg_dir.name})",
+                "content":      _trim(relevant),
+                "fetch_method": "local_source",
+                "fetched_at":   datetime.now(timezone.utc).isoformat(),
+                "score":        10,
+            })
+            if len(sources) >= 3:
+                break
+        if sources:
+            break
+    return sources
+
+def _find_package_dirs(hint: str) -> list[Path]:
+    """Locate package dir via shebang, pip show, or targeted glob — no recursive walk."""
+    import glob as _glob
+    candidates: list[Path] = []
+    hn = hint.replace("-", "_")
+
+    binary = shutil.which(hint)
+    if binary:
+        try:
+            shebang = Path(binary).read_text(errors="replace").splitlines()[0]
+            m = re.search(r'(/[^\s]+/bin/python[\d.]*)', shebang)
+            if m:
+                venv_root = Path(m.group(1)).parent.parent
+                for sp in _glob.glob(str(venv_root / "lib" / "python*" / "site-packages" / hn)):
+                    p = Path(sp)
+                    if p.is_dir():
+                        candidates.append(p)
+        except Exception:
+            pass
+    if candidates:
+        return candidates[:3]
+
+    try:
+        r = subprocess.run(["pip", "show", hint], capture_output=True, text=True, timeout=8)
+        if r.returncode == 0:
+            for line in r.stdout.splitlines():
+                if line.startswith("Location:"):
+                    loc = Path(line.split(":", 1)[1].strip()) / hn
+                    if loc.is_dir() and loc not in candidates:
+                        candidates.append(loc)
+    except Exception:
+        pass
+    if candidates:
+        return candidates[:3]
+
+    for pattern in [
+        f"/workspace/venvs/{hint}/lib/python*/site-packages/{hn}",
+        f"/workspace/venvs/*/lib/python*/site-packages/{hn}",
+        f"/root/.local/lib/python*/site-packages/{hn}",
+        f"/usr/lib/python*/dist-packages/{hn}",
+    ]:
+        for match in _glob.glob(pattern):
+            p = Path(match)
+            if p.is_dir() and p not in candidates:
+                candidates.append(p)
+            if len(candidates) >= 3:
+                return candidates
+    return candidates[:3]
+
+def _extract_relevant(text: str, terms: list[str], ctx: int = 8) -> str:
+    lines = text.splitlines()
+    hit_idxs = set()
+    for i, line in enumerate(lines):
+        if any(t in line.lower() for t in terms):
+            hit_idxs.update(range(max(0, i - ctx // 2), min(len(lines), i + ctx // 2 + 1)))
+    if not hit_idxs:
+        return ""
+    out, prev = [], None
+    for i in sorted(hit_idxs):
+        if prev is not None and i > prev + 1:
+            out.append("  ...")
+        out.append(lines[i])
+        prev = i
+    return "\n".join(out)
+
+# ── GitHub search ─────────────────────────────────────────────────────────────
+
+def search_github(query: str, hint: str | None) -> list[dict]:
+    cached = cache_get("gh_search", f"{hint}:{query}")
+    if cached:
+        return cached.get("results", [])
+    search_q = f"{hint} {query}" if hint else query
+    try:
+        resp = requests.get(
+            "https://api.github.com/search/repositories",
+            params={"q": search_q, "sort": "stars", "per_page": 4},
+            headers={"Accept": "application/vnd.github.v3+json", "User-Agent": "ds-research"},
+            timeout=12,
+        )
+        if resp.status_code == 403:
+            _warn("GitHub API rate limited")
+            return []
+        items = resp.json().get("items", [])
+    except Exception as e:
+        _warn(f"GitHub search failed: {e}")
+        return []
+    results = []
+    for item in items[:3]:
+        repo, branch = item["full_name"], item.get("default_branch", "main")
+        readme_url = f"https://raw.githubusercontent.com/{repo}/{branch}/README.md"
+        fetched = fetch_url(readme_url, meta=RunMeta())
+        if not fetched.get("error"):
+            fetched["title"] = f"{repo} README"
+            fetched["score"] = _domain_score(f"https://github.com/{repo}") + 2
+            results.append(fetched)
+        homepage = item.get("homepage", "")
+        if homepage and homepage.startswith("http") and len(results) < 3:
+            fetched_hp = fetch_url(homepage, meta=RunMeta())
+            if not fetched_hp.get("error"):
+                fetched_hp["score"] = _domain_score(homepage) + 1
+                results.append(fetched_hp)
+    cache_set("gh_search", f"{hint}:{query}", {"results": results})
+    return results
+
+# ── Search providers ──────────────────────────────────────────────────────────
+
+def search_jina_api(query: str, meta: RunMeta, cfg: RunConfig) -> list[dict]:
+    """Jina s.jina.ai search — requires JINA_API_KEY; burns ~10k tokens/request."""
+    if cfg.no_paid or not JINA_KEY:
+        return []
+    max_searches = 3 if cfg.deep else 1
+    if meta.jina_search_requests >= max_searches:
+        return []
+
+    cached = cache_get("jina_search", query)
+    if cached and not cfg.refresh:
+        meta.search_providers.append("jina_search(cached)")
+        return _jina_items_to_sources(cached.get("data", []))
+
+    try:
+        resp = requests.get(
+            "https://s.jina.ai/",
+            params={"q": query},
+            headers={"Authorization": f"Bearer {JINA_KEY}", "Accept": "application/json",
+                     "User-Agent": UA},
+            timeout=25,
+        )
+        if resp.status_code != 200:
+            _warn(f"Jina Search returned {resp.status_code}")
+            return []
+        data = resp.json().get("data", [])
+        cache_set("jina_search", query, {"data": data})
+        meta.jina_search_requests += 1
+        meta.used_jina_search = True
+        meta.used_jina_key = True
+        meta.search_providers.append("jina_search")
+        _record_jina_usage(1)  # track cumulative usage for balance monitoring
+        return _jina_items_to_sources(data)
+    except Exception as e:
+        _warn(f"Jina Search failed: {e}")
+        return []
+
+def _jina_items_to_sources(items: list[dict]) -> list[dict]:
+    sources = []
+    for r in items:
+        content = r.get("content", r.get("text", ""))
+        if content:
+            sources.append({
+                "url":          r.get("url", ""),
+                "title":        r.get("title", ""),
+                "content":      _trim(content),
+                "fetch_method": "jina_search",
+                "fetched_at":   datetime.now(timezone.utc).isoformat(),
+                "score":        _domain_score(r.get("url", "")),
+            })
+    return sources
+
+def search_ddgs(query: str, n: int = 6) -> list[dict]:
+    cached = cache_get("ddgs", query)
+    if cached:
+        return cached.get("results", [])
+    try:
+        try:
+            from ddgs import DDGS
+        except ImportError:
+            from duckduckgo_search import DDGS
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with DDGS() as d:
+                raw = list(d.text(query, max_results=n))
+        results = [{"title": r["title"], "url": r["href"], "snippet": r["body"]} for r in raw]
+        cache_set("ddgs", query, {"results": results})
+        return results
+    except Exception as e:
+        _warn(f"DDGS failed: {e}")
+        return _ddg_html_fallback(query, n)
+
+def _ddg_html_fallback(query: str, n: int = 6) -> list[dict]:
+    try:
+        resp = requests.post(
+            "https://html.duckduckgo.com/html/",
+            data={"q": query, "kl": "us-en"},
+            headers={"User-Agent": UA}, timeout=15,
+        )
+        resp.raise_for_status()
+    except Exception as e:
+        _warn(f"DDG HTML fallback failed: {e}")
+        return []
+    soup = BeautifulSoup(resp.text, "lxml")
+    results = []
+    for r in soup.select(".result"):
+        a = r.select_one(".result__a")
+        if not a:
+            continue
+        href = a.get("href", "")
+        if "duckduckgo.com/l/" in href or href.startswith("//"):
+            parsed = urlparse(href if href.startswith("http") else "https:" + href)
+            url = unquote(parse_qs(parsed.query).get("uddg", [""])[0])
+        else:
+            url = href
+        if not url or "duckduckgo.com" in url:
+            continue
+        snippet = r.select_one(".result__snippet")
+        results.append({"title": a.get_text(strip=True), "url": url,
+                         "snippet": snippet.get_text(strip=True) if snippet else ""})
+        if len(results) >= n:
+            break
+    return results
+
+def search_brave(query: str, cfg: RunConfig) -> list[dict]:
+    if cfg.no_paid or not BRAVE_KEY:
+        return []
+    cached = cache_get("brave", query)
+    if cached:
+        return cached.get("results", [])
+    try:
+        resp = requests.get(
+            "https://api.search.brave.com/res/v1/web/search",
+            params={"q": query, "count": 6},
+            headers={"Accept": "application/json", "X-Subscription-Token": BRAVE_KEY},
+            timeout=12,
+        )
+        results = [{"title": r["title"], "url": r["url"], "snippet": r.get("description", "")}
+                   for r in resp.json().get("web", {}).get("results", [])]
+        cache_set("brave", query, {"results": results})
+        return results
+    except Exception as e:
+        _warn(f"Brave search failed: {e}")
+        return []
+
+# ── Quality assessment ────────────────────────────────────────────────────────
+
+def _ddgs_quality_poor(sources: list[dict], hint: str | None) -> bool:
+    """Return True if fetched DDGS sources are low quality for this query."""
+    good = [s for s in sources if not s.get("error") and len(s.get("content", "")) > 200]
+    if not good:
+        return True
+    hl = hint.lower() if hint else ""
+    good_count = 0.0
+    for s in good:
+        url, title = s.get("url", ""), (s.get("title") or "").lower()
+        ds = _domain_score(url)
+        if ds < 0:
+            continue  # penalized
+        if hl and (hl in title or hl in url.lower()):
+            good_count += 1
+        elif ds >= 2:
+            good_count += 1
+        elif len(s.get("content", "")) > 500:
+            good_count += 0.5
+    return good_count < 1
+
+# ── Fetch ─────────────────────────────────────────────────────────────────────
+
+def fetch_url(url: str, meta: RunMeta, refresh: bool = False, cfg: RunConfig | None = None) -> dict:
+    # Local file: read directly, no network
+    if url.startswith("/"):
+        path = Path(url)
+        if path.exists():
+            return {"url": url, "title": path.name,
+                    "content": _trim(path.read_text(errors="replace")),
+                    "fetch_method": "local_file",
+                    "fetched_at": datetime.now(timezone.utc).isoformat()}
+        return {"url": url, "error": "file not found", "content": ""}
+
+    if not refresh:
+        cached = cache_get("fetch", url)
+        if cached:
+            cached["from_cache"] = True
+            meta.cache_hits += 1
+            meta.fetch_providers.add(cached.get("fetch_method", "cached"))
+            return cached
+
+    no_paid = cfg.no_paid if cfg else False
+    result = (_try_jina_nokey(url) or
+              _try_scrapfly(url) or
+              _try_direct(url))
+    # If no-key Jina failed and we have a key and no_paid is False, retry with key
+    if not result and JINA_KEY and not no_paid:
+        result = _try_jina_keyed(url, meta)
+
+    if result:
+        result.setdefault("fetched_at", datetime.now(timezone.utc).isoformat())
+        meta.fetch_providers.add(result.get("fetch_method", "unknown"))
+        cache_set("fetch", url, result)
+    return result or {"url": url, "error": "all fetch methods failed", "content": ""}
+
+def _try_jina_nokey(url: str) -> dict | None:
+    try:
+        resp = requests.get(f"https://r.jina.ai/{url}",
+                            headers={"Accept": "text/plain", "X-Timeout": "15", "User-Agent": UA},
+                            timeout=25)
+        if resp.status_code == 429:
+            return None  # rate-limited; caller will retry with key
+        if resp.status_code != 200 or len(resp.text) < 100:
+            return None
+        text = resp.text
+        title = next((l[6:].strip() for l in text.splitlines()[:5] if l.startswith("Title:")), "")
+        return {"url": url, "title": title, "content": _trim(text), "fetch_method": "jina_reader"}
+    except Exception:
+        return None
+
+def _try_jina_keyed(url: str, meta: RunMeta) -> dict | None:
+    if not JINA_KEY:
+        return None
+    try:
+        resp = requests.get(f"https://r.jina.ai/{url}",
+                            headers={"Accept": "text/plain", "X-Timeout": "15",
+                                     "Authorization": f"Bearer {JINA_KEY}", "User-Agent": UA},
+                            timeout=25)
+        if resp.status_code != 200 or len(resp.text) < 100:
+            return None
+        meta.used_jina_key = True
+        text = resp.text
+        title = next((l[6:].strip() for l in text.splitlines()[:5] if l.startswith("Title:")), "")
+        return {"url": url, "title": title, "content": _trim(text), "fetch_method": "jina_reader(keyed)"}
+    except Exception:
+        return None
+
+def _try_scrapfly(url: str) -> dict | None:
+    if not SCRAPFLY_KEY:
+        return None
+    try:
+        resp = requests.get("https://api.scrapfly.io/scrape",
+                            params={"key": SCRAPFLY_KEY, "url": url, "render_js": "false"},
+                            timeout=40)
+        result = resp.json().get("result", {})
+        html = result.get("content", "")
+        if not html or result.get("status_code", 0) not in (200, 201):
+            return None
+        soup = BeautifulSoup(html, "lxml")
+        title = (soup.title.string or "").strip()
+        for tag in soup(["script","style","nav","footer","aside","header"]):
+            tag.decompose()
+        main = soup.find("main") or soup.find("article") or soup.body
+        text = _clean_text(main.get_text(separator="\n") if main else soup.get_text(separator="\n"))
+        return {"url": url, "title": title, "content": _trim(text), "fetch_method": "scrapfly"}
+    except Exception:
+        return None
+
+def _try_direct(url: str) -> dict | None:
+    try:
+        resp = requests.get(url, headers={"User-Agent": UA}, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+        if resp.status_code != 200:
+            return None
+        soup = BeautifulSoup(resp.text, "lxml")
+        title = (soup.title.string or "").strip()
+        for tag in soup(["script","style","nav","footer","aside","header"]):
+            tag.decompose()
+        main = soup.find("main") or soup.find("article") or soup.find(id="content") or soup.body
+        text = _clean_text(main.get_text(separator="\n") if main else soup.get_text(separator="\n"))
+        return {"url": url, "title": title, "content": _trim(text), "fetch_method": "direct_http"}
+    except Exception:
+        return None
+
+# ── Text helpers ──────────────────────────────────────────────────────────────
+
+def _clean_text(text: str) -> str:
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    deduped, prev = [], None
+    for l in lines:
+        if l != prev or len(l) > 60:
+            deduped.append(l)
+        prev = l
+    return "\n".join(deduped)
+
+def _trim(text: str, max_chars: int = MAX_CONTENT_CHARS) -> str:
+    return text if len(text) <= max_chars else text[:max_chars] + f"\n\n[truncated at {max_chars} chars]"
+
+def _domain_score(url: str) -> float:
+    host = urlparse(url).hostname or ""
+    for domain, boost in BOOST_DOMAINS.items():
+        if host.endswith(domain):
+            return boost
+    for penalised in PENALISE_DOMAINS:
+        if host.endswith(penalised):
+            return -2
+    return 0
+
+def _warn(msg: str):
+    print(f"[ds_research] {msg}", file=sys.stderr)
+
+# ── Ranking ───────────────────────────────────────────────────────────────────
+
+def rank_candidates(candidates: list[dict], query: str, hint: str | None) -> list[dict]:
+    seen, scored = set(), []
+    hint_lower = hint.lower() if hint else ""
+    query_words = set(re.findall(r'\b\w{3,}\b', query.lower())) - STOPWORDS
+    for c in candidates:
+        url = c.get("url", "")
+        if url in seen:
+            continue
+        seen.add(url)
+        score = c.get("score", 0) + _domain_score(url)
+        title_lower = (c.get("title") or "").lower()
+        if hint_lower and (hint_lower in title_lower or hint_lower in url.lower()):
+            score += 3
+        score += sum(1 for w in query_words if w in title_lower) * 0.5
+        if re.search(r'/(docs?|api|guide|reference|readme)/', url, re.I):
+            score += 1
+        if hint_lower and hint_lower not in title_lower and hint_lower not in url.lower():
+            score -= 2
+        c["_score"] = score
+        scored.append(c)
+    scored.sort(key=lambda x: x["_score"], reverse=True)
+    return scored
+
+# ── Main orchestrator ─────────────────────────────────────────────────────────
+
+def resolve_sources(cfg: RunConfig, meta: RunMeta) -> list[dict]:
+    """Full provider cascade. Returns fetched, content-populated sources."""
+    # Explicit URLs: fetch only, no search
+    if cfg.explicit_urls:
+        meta.search_providers.append("explicit_urls")
+        sources = []
+        for url in cfg.explicit_urls[:cfg.limit]:
+            _warn(f"Fetching: {url[:80]}")
+            f = fetch_url(url, meta=meta, refresh=cfg.refresh, cfg=cfg)
+            if not f.get("error"):
+                f["score"] = _domain_score(url) + 5
+                sources.append(f)
+                _warn(f"  OK ({len(f.get('content',''))} chars, {f.get('fetch_method','?')}, cache={f.get('from_cache',False)})")
+            else:
+                _warn(f"  Failed: {f['error']}")
+        meta.total_sources = len(sources)
+        return sources
+
+    hint = extract_package_hint(cfg.query)
+    tech = is_technical(cfg.query)
+    candidates: list[dict] = []
+
+    # 1. Local source (technical queries)
+    if tech and hint:
+        _warn(f"Checking local source for: {hint}")
+        local = search_local(cfg.query, hint)
+        if local:
+            _warn(f"  Found {len(local)} local source file(s)")
+            candidates.extend(local)
+            meta.search_providers.append("local_source")
+            # If local source is sufficient and not deep mode, skip web search
+            good_local = [s for s in local if len(s.get("content","")) > 200]
+            if len(good_local) >= cfg.limit and not cfg.deep and not cfg.force_jina:
+                ranked = rank_candidates(candidates, cfg.query, hint)
+                meta.total_sources = min(len(ranked), cfg.limit)
+                return ranked[:cfg.limit]
+
+    # 2. GitHub API (technical queries without enough local)
+    if tech and hint and len(candidates) < cfg.limit:
+        _warn(f"Searching GitHub for: {hint}")
+        gh = search_github(cfg.query, hint)
+        if gh:
+            _warn(f"  Found {len(gh)} GitHub source(s)")
+            candidates.extend(gh)
+            meta.search_providers.append("github_api")
+
+    # 3. DDGS (general or technical where local/GH wasn't enough)
+    if len(candidates) < cfg.limit or cfg.deep:
+        for q in generate_queries(cfg.query, hint):
+            _warn(f"Searching DDGS: {q[:70]}")
+            ddg_results = search_ddgs(q, n=cfg.limit + 3)
+            if ddg_results:
+                fetched = _fetch_results(ddg_results, cfg, meta)
+                candidates.extend(fetched)
+                meta.search_providers.append("ddgs")
+                break
+
+    # 4. Quality check → escalate to Jina Search if needed
+    ddgs_sources = [c for c in candidates if c.get("fetch_method") not in ("local_source","local_file")]
+    quality_poor = _ddgs_quality_poor(ddgs_sources, hint)
+    meta.ddgs_quality_poor = quality_poor
+
+    use_jina_search = (
+        cfg.force_jina or
+        cfg.deep or
+        (quality_poor and tech and not cfg.no_paid and bool(JINA_KEY))
+    )
+
+    if use_jina_search and not cfg.no_paid and JINA_KEY:
+        _warn("Using Jina Search for precision...")
+        jina_sources = search_jina_api(cfg.query, meta, cfg)
+        if jina_sources:
+            candidates.extend(jina_sources)
+
+    # 5. Optional Brave (if key present and not no-paid)
+    if BRAVE_KEY and not cfg.no_paid and len(candidates) < cfg.limit:
+        brave_results = search_brave(cfg.query, cfg)
+        if brave_results:
+            candidates.extend(_fetch_results(brave_results, cfg, meta))
+            meta.search_providers.append("brave")
+
+    ranked = rank_candidates(candidates, cfg.query, hint)
+    good = [s for s in ranked if not s.get("error") and len(s.get("content","")) > 100][:cfg.limit]
+    meta.total_sources = len(good)
+    return good
+
+def _fetch_results(results: list[dict], cfg: RunConfig, meta: RunMeta) -> list[dict]:
+    fetched = []
+    for r in results:
+        url = r.get("url","")
+        if not url:
+            continue
+        _warn(f"Fetching: {url[:80]}")
+        f = fetch_url(url, meta=meta, refresh=cfg.refresh, cfg=cfg)
+        if not f.get("error"):
+            f.setdefault("title", r.get("title",""))
+            f["score"] = _domain_score(url)
+            fetched.append(f)
+            _warn(f"  OK ({len(f.get('content',''))} chars, {f.get('fetch_method','?')}, cache={f.get('from_cache',False)})")
+        else:
+            _warn(f"  Failed: {f['error']}")
+    return fetched
+
+# ── Bundle + DeepSeek ─────────────────────────────────────────────────────────
+
+def build_bundle(cfg: RunConfig, sources: list[dict], meta: RunMeta) -> str:
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    lines = [
+        f"Research question: {cfg.query}",
+        f"Bundle assembled: {now}",
+        f"Providers: {', '.join(meta.search_providers) or 'none'}",
+        f"Sources: {len(sources)}",
+        "",
+    ]
+    for i, src in enumerate(sources, 1):
+        lines += [
+            "=" * 60,
+            f"SOURCE {i}: {src.get('title','(no title)')}",
+            f"URL: {src['url']}",
+            f"Fetched: {src.get('fetched_at','unknown')}",
+            f"Method: {src.get('fetch_method','unknown')}",
+            "",
+            src.get("content","(no content)"),
+            "",
+        ]
+    lines += [
+        "=" * 60, "",
+        "INSTRUCTIONS:",
+        "Answer the research question using ONLY the source content above.",
+        "Structure your response as:",
+        "  ANSWER: [direct answer]",
+        "  VERIFIED: [source-backed claims — cite URL or file path for each]",
+        "  INFERRED: [reasonable inferences beyond explicit source statements]",
+        "  UNCERTAIN: [aspects the sources don't resolve]",
+        "  NOT FOUND: [question aspects not in any source]",
+        "  PRIOR KNOWLEDGE: [anything beyond these sources — label UNVERIFIED]",
+        "  SOURCES USED: [list each URL/path with fetched_at]",
+        "",
+        "Cite local file paths as-is. Do not hallucinate. If sources are",
+        "insufficient or irrelevant, say so plainly in NOT FOUND.",
+    ]
+    return "\n".join(lines)
+
+def call_deepseek(bundle: str, cfg: RunConfig) -> str:
+    cmd = [str(DS_FLASH)]
+    if cfg.use_flash:
+        cmd.append("--flash")
+    cmd.append("web_research")
+    r = subprocess.run(cmd, input=bundle, capture_output=True, text=True, timeout=120)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip())
+    return r.stdout.strip()
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+
+def log_run(cfg: RunConfig, sources: list[dict], response: str, meta: RunMeta):
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    try:
+        log_data = {
+            "timestamp": ts,
+            "task": "web_research",
+            "model": "deepseek-v4-flash" if cfg.use_flash else "deepseek-v4-pro",
+            "query": cfg.query,
+            "search_providers": meta.search_providers,
+            "fetch_providers": list(meta.fetch_providers),
+            "used_jina_key": meta.used_jina_key,
+            "used_jina_search": meta.used_jina_search,
+            "jina_search_requests": meta.jina_search_requests,
+            "cache_hits": meta.cache_hits,
+            "sources": [{"url": _redact(s["url"]), "method": s.get("fetch_method"),
+                         "chars": len(s.get("content",""))} for s in sources],
+            "response_chars": len(response),
+        }
+        (LOGS_DIR / f"{ts}_web_research.json").write_text(
+            json.dumps(log_data, ensure_ascii=False, indent=2)
+        )
+    except Exception:
+        pass
+
+# ── Output ────────────────────────────────────────────────────────────────────
+
+def print_result(response: str, sources: list[dict], cfg: RunConfig, meta: RunMeta):
+    w = 72
+    print("─" * w)
+    print(f"ds_research: {cfg.query[:60]}")
+    print("─" * w)
+    print()
+    for line in response.splitlines():
+        print(textwrap.fill(line, width=w) if len(line) > w else line)
+    print()
+    # Metadata block
+    print("─" * w)
+    print(f"search_provider:               {', '.join(meta.search_providers) or 'none'}")
+    print(f"fetch_provider:                {', '.join(dict.fromkeys(meta.fetch_providers)) or 'none'}")
+    print(f"used_jina_key:                 {meta.used_jina_key}")
+    print(f"used_jina_search:              {meta.used_jina_search}")
+    print(f"cache_hit:                     {meta.cache_hits > 0} ({meta.cache_hits} source(s))")
+    print(f"jina_search_requests_used:     {meta.jina_search_requests}")
+    print(f"sources_fetched:               {meta.total_sources}")
+    if not JINA_KEY:
+        print("ℹ  JINA_API_KEY not set — Jina Search unavailable")
+    if cfg.no_paid:
+        print("ℹ  --no-paid-token-providers active — keyed providers disabled")
+    if meta.ddgs_quality_poor and not meta.used_jina_search:
+        print("⚠  DDGS result quality was poor — consider --jina-search for precision")
+    # Jina balance warning (shown every run if approaching limit)
+    bal_warn = jina_balance_warning()
+    if bal_warn:
+        print(bal_warn)
+    print("─" * w)
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        print(__doc__)
+        sys.exit(0)
+
+    cfg = RunConfig()
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if   a == "--flash":                   cfg.use_flash = True
+        elif a == "--refresh":                 cfg.refresh = True
+        elif a == "--jina-search":             cfg.force_jina = True
+        elif a == "--deep":                    cfg.deep = True
+        elif a == "--no-paid-token-providers": cfg.no_paid = True
+        elif a == "--limit" and i+1 < len(args):
+            i += 1; cfg.limit = int(args[i])
+        elif a == "--url" and i+1 < len(args):
+            i += 1; cfg.explicit_urls = [args[i].strip()]
+        elif a == "--urls" and i+1 < len(args):
+            i += 1; cfg.explicit_urls = [u.strip() for u in args[i].split(",")]
+        else:
+            cfg.query = a
+        i += 1
+
+    if not cfg.query and not cfg.explicit_urls:
+        _warn("No query or URLs provided."); sys.exit(1)
+    if not cfg.query:
+        cfg.query = f"Summarise: {', '.join(cfg.explicit_urls)}"
+
+    meta = RunMeta()
+    sources = resolve_sources(cfg, meta)
+
+    if not sources:
+        hint = extract_package_hint(cfg.query)
+        print("ERROR: no sources fetched.", file=sys.stderr)
+        print("  Try: ds_research --url <url> \"question\"", file=sys.stderr)
+        if hint:
+            print(f"  Or:  ds_research --jina-search \"{cfg.query}\"", file=sys.stderr)
+        sys.exit(1)
+
+    bundle = build_bundle(cfg, sources, meta)
+    _warn(f"Calling DeepSeek {'flash' if cfg.use_flash else 'pro'} ({len(bundle)} chars)...")
+
+    try:
+        response = call_deepseek(bundle, cfg)
+    except Exception as e:
+        _warn(f"DeepSeek failed: {e}"); sys.exit(1)
+
+    log_run(cfg, sources, response, meta)
+    print_result(response, sources, cfg, meta)
+
+if __name__ == "__main__":
+    main()

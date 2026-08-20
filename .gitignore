@@ -1,0 +1,10 @@
+.env
+logs/
+cache/
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+ds_research_bundle.tar.gz
+*.bak_*
+*.bak
