@@ -1,5 +1,11 @@
 # ds_research — Source-Backed Web Research for Claude Code
 
+> **Maintenance status (October 2026): historical tool.** OSF retired DeepSeek
+> from its active production agent stack. This repository remains public as a
+> reusable example of source-backed delegation, but is not a supported part of
+> the current OSF deployment. Provider APIs, prices and access rules may have
+> changed; verify them before running the scripts.
+
 ## The right tool for each job
 
 | Task | Command |
