@@ -35,7 +35,7 @@ class ResumableRunTests(unittest.TestCase):
         first = self.run_units(["media_001", "media_002"])
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         self.assertEqual((self.job / "out/media_001.out").read_text(), "media_001")
-        again = self.run_units(["media_001", "media_002"], command="exit 91")
+        again = self.run_units(["media_001", "media_002"], command='exit 91; printf "%s" "{UNIT}"')
         self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
         self.assertIn("skipped=2", again.stdout)
         self.assertEqual((self.job / "out/media_002.out").read_text(), "media_002")
