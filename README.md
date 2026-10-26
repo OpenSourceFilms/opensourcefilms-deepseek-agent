@@ -148,9 +148,16 @@ placed somewhere durable (e.g. a persistent-volume path).
 ## Resumable, cap-immune delegation
 
 `resumable_run.sh` and `RESUMABLE_DELEGATION.md` document a pattern for
-running long batches of DeepSeek calls that survive an Anthropic session cap
-or a pod restart — see `RESUMABLE_DELEGATION.md` for the full design and
-usage.
+running long batches of delegated commands with checkpointed output. The
+historical explanation of independent-provider execution appears in that
+document. `resumable_run.sh` now uses **non-executable unit interpolation**,
+collision-resistant filenames for complex unit IDs, and **create-only**
+checkpoint publication. Its command template remains **trusted shell code**;
+always quote `"{UNIT}"` inside the template when the unit is one argument.
+Existing simple-name checkpoints keep their prior filenames. Eight isolated
+Bash subprocess regression tests run offline through GitHub Actions. These
+tests do not make an API call or establish that the historical DeepSeek
+integration is supported, secure to deploy, or current.
 
 ## What this is not
 
