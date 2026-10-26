@@ -5,6 +5,7 @@ Only Bash and temporary files are used; never start DeepSeek or network calls.
 from __future__ import annotations
 
 from pathlib import Path
+import hashlib
 import shutil
 import subprocess
 import tempfile
@@ -57,6 +58,39 @@ class ResumableRunTests(unittest.TestCase):
         outputs = sorted((self.job / "out").glob("*.out"))
         self.assertEqual(len(outputs), 3)
         self.assertEqual({f.read_text() for f in outputs}, set(units))
+
+    def test_generated_complex_id_cannot_alias_literal_simple_unit(self):
+        complex_id = "a/b"
+        digest = hashlib.sha256(complex_id.encode()).hexdigest()[:16]
+        colliding_simple_id = f"a_b-{digest}"
+        result = self.run_units([complex_id, colliding_simple_id])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.job / "out" / f"~{colliding_simple_id}.out").read_text(),
+                         complex_id)
+        self.assertEqual((self.job / "out" / f"{colliding_simple_id}.out").read_text(),
+                         colliding_simple_id)
+        self.assertIn("ran=2", result.stdout)
+
+    def test_competing_directory_at_publication_is_not_success(self):
+        self.units.write_text("race\n", encoding="utf-8")
+        cmd = 'sleep 0.4; printf "%s" "{UNIT}"'
+        proc = subprocess.Popen(
+            ["bash", str(self.script), str(self.job), str(self.units), cmd],
+            cwd=self.root, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True,
+        )
+        outdir = self.job / "out"
+        deadline = time.monotonic() + 5
+        while not list(outdir.glob(".race.*")) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(list(outdir.glob(".race.*")), "command never started")
+        rival_directory = outdir / "race.out"
+        rival_directory.mkdir()
+        stdout, stderr = proc.communicate(timeout=8)
+        self.assertNotEqual(proc.returncode, 0, stdout + stderr)
+        self.assertIn("failed=1", stdout)
+        self.assertEqual(list(rival_directory.iterdir()), [])
+        self.assertEqual(list(outdir.glob(".race.*")), [])
 
     def test_failed_or_empty_commands_are_not_checkpoints(self):
         failed = self.run_units(["failed"], command="printf partial; exit 5")
