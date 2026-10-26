@@ -72,7 +72,7 @@ class ResumableRunTests(unittest.TestCase):
         self.assertIn("ran=2", result.stdout)
 
     def test_competing_directory_at_publication_is_not_success(self):
-        self.units.write_text("race\\n", encoding="utf-8")
+        self.units.write_text("race\n", encoding="utf-8")
         cmd = 'sleep 0.4; printf "%s" "{UNIT}"'
         proc = subprocess.Popen(
             ["bash", str(self.script), str(self.job), str(self.units), cmd],
