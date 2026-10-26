@@ -154,18 +154,22 @@ document. `resumable_run.sh` now uses **non-executable unit interpolation**,
 collision-resistant filenames for complex unit IDs, and **create-only**
 checkpoint publication. Its command template remains **trusted shell code**;
 always quote `"{UNIT}"` inside the template when the unit is one argument.
-Existing simple-name checkpoints keep their prior filenames. Eight isolated
-Bash subprocess regression tests run offline through GitHub Actions. These
+Existing simple-name checkpoints keep their prior filenames. Complex-unit
+checkpoint names now begin with `~` to avoid an alias with simple IDs;
+previous complex-unit checkpoint paths are not implicitly migrated, so review
+any historical checkpoint inventory before rerunning such batches. The
+create-only `ln -T` publication requires GNU coreutils and refuses a racing
+destination directory. Ten isolated Bash subprocess regression tests run
+offline through GitHub Actions. These
 tests do not make an API call or establish that the historical DeepSeek
 integration is supported, secure to deploy, or current.
 
 ## What this is not
 
-Not a polished framework — it's the actual tool OSF uses day to day
-(3 commits, June-August 2026, still actively developed). No config-file
-format beyond `.env`/env vars, no plugin system. Published because it's real,
-working delegation infrastructure, not because it's meant to be a drop-in
-library for another team's different setup.
+Not a polished framework. This archive preserves engineering patterns from
+OSF's former DeepSeek integration; OSF no longer uses it in the active agent
+stack. It has no config-file format beyond `.env`/env vars, no plugin system,
+and is not maintained as a general-purpose deployment product.
 
 ---
 
