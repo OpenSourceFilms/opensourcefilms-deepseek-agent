@@ -34,9 +34,10 @@ while IFS= read -r unit || [ -n "$unit" ]; do
   case "$unit" in \#*) continue;; esac
   total=$((total+1))
 
-  # Keep the old on-disk ID for simple tokens so existing checkpoints remain
-  # resumable. For all other units, append an identity hash: e.g. a/b and
-  # a?b no longer collapse to the same a_b.out. Limit path-component length.
+  # Preserve on-disk checkpoint IDs for simple historical units. Complex
+  # units occupy a separate '~' namespace (disallowed by simple-ID regex),
+  # so a literal simple ID can never alias an encoded complex ID. Earlier
+  # complex-unit checkpoint names are not silently migrated/reused.
   if [[ "$unit" =~ ^[A-Za-z0-9._-]+$ ]] && [ "${#unit}" -le 100 ] &&
      [ "$unit" != "." ] && [ "$unit" != ".." ]; then
     id="$unit"
@@ -45,7 +46,7 @@ while IFS= read -r unit || [ -n "$unit" ]; do
     slug="${slug:0:64}"
     digest="$(printf '%s' "$unit" | sha256sum)" || exit 1
     digest="${digest%% *}"
-    id="${slug:-unit}-${digest:0:16}"
+    id="~${slug:-unit}-${digest:0:16}"
   fi
 
   dest="$OUT/$id.out"
@@ -66,7 +67,9 @@ while IFS= read -r unit || [ -n "$unit" ]; do
   if UNIT="$unit" bash -c "$cmd" >"$tmp" 2>>"$LOG" && [ -s "$tmp" ]; then
     # Same directory/filesystem: hard-link publication is atomic and
     # create-only. A concurrent invocation cannot overwrite a completed unit.
-    if ln -- "$tmp" "$dest" 2>>"$LOG"; then
+    # -T forbids ln from treating a racing directory/symlink-to-directory
+    # as a destination directory and falsely reporting success.
+    if ln -T -- "$tmp" "$dest" 2>>"$LOG"; then
       rm -f -- "$tmp"
       ran=$((ran+1))
       echo "$(ts) OK   $unit" >>"$LOG"
