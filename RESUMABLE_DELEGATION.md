@@ -60,9 +60,23 @@ On wake, re-dispatch the checkpointed task; it resumes instead of restarting.
 resumable_run.sh <job_dir> <units_file> <command_template>
 ```
 - `units_file`: one work-unit token per line (a filename, media_id, section id, or question).
-- `command_template`: shell run once per unit with `{UNIT}` substituted and stdout captured to
-  `<job_dir>/out/<unit>.out`; typically a `ds_flash.sh` / `ds_research` call.
-- Re-running skips units whose `.out` already exists non-empty. Launch with `run_in_background`.
+- `command_template`: **trusted, operator-authored shell code** run once per unit.
+  `{UNIT}` is replaced with the literal shell variable `${UNIT}` before execution;
+  the actual line from `units_file` is passed as an **environment variable** and is
+  never interpolated into executable shell source. Always **double-quote each
+  `{UNIT}` placeholder** where it represents one shell argument, for example
+  `cat "/path/to/{UNIT}"`; otherwise shell word-splitting may still occur.
+  The template itself is not a sandbox and must never come from untrusted users.
+- For simple alphanumeric/`._-` unit IDs of at most 100 characters,
+  checkpoint names remain `<job_dir>/out/<unit>.out` for backward
+  compatibility. More complex IDs use a shortened readable prefix and
+  SHA-256-derived suffix to prevent different names collapsing together.
+  Existing checkpoint files must be regular, nonempty and **not symlinks**.
+- Re-running skips completed units. A completed output is published using
+  **create-only hard-link semantics**: a competing process cannot overwrite it.
+  Incomplete/empty or symlinked destinations are refused, not deleted.
+  A failed command or racing publication returns an unsuccessful batch status.
+  Launch with `run_in_background` only in an environment you control.
 - Final synthesis: a last unit (or a follow-up call) that concatenates `<job_dir>/out/*` and
   pipes to `ds_flash.sh` for the combined result.
 
@@ -70,6 +84,6 @@ Example (cap-immune doc consolidation):
 ```
 printf '%s\n' MASTER.md DECISIONS.md ROADMAP.md > job/units.txt
 resumable_run.sh job job/units.txt \
-  'cat /path/to/your/project/{UNIT} | ds_flash.sh summarise "pathologies + unimplemented ideas in {UNIT}"'
+  'cat "/path/to/your/project/{UNIT}" | ds_flash.sh summarise "pathologies + unimplemented ideas in {UNIT}"'
 # then: cat job/out/*.out | ds_flash.sh plan "synthesise one canonical-backbone proposal"
 ```

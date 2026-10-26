@@ -5,12 +5,14 @@ on:
     paths:
       - ".github/workflows/offline-selfcheck.yml"
       - "tests/selfcheck.sh"
+      - "tests/test_resumable_run.py"
       - "ds_research"
       - "*.sh"
   pull_request:
     paths:
       - ".github/workflows/offline-selfcheck.yml"
       - "tests/selfcheck.sh"
+      - "tests/test_resumable_run.py"
       - "ds_research"
       - "*.sh"
   workflow_dispatch:
@@ -24,3 +26,5 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Offline syntax and secret-pattern checks
         run: bash tests/selfcheck.sh
+      - name: Test resumable unit safety without provider calls
+        run: python3 -B -m unittest discover -s tests -p 'test_resumable_run.py' -v
